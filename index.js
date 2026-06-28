@@ -24,6 +24,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import axios from 'axios';
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import { readFileSync } from 'fs';
 import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'crypto';
 import { resolve, dirname } from 'path';
@@ -54,37 +55,45 @@ try {
 // Configuration
 // ---------------------------------------------------------------------------
 
-const FUB_API_KEY = process.env.FUB_API_KEY;
-if (!FUB_API_KEY) {
-  console.error('ERROR: FUB_API_KEY environment variable is required.');
-  console.error('Run "npm run setup" to configure, or set FUB_API_KEY in your environment.');
-  process.exit(1);
-}
-// Catch the classic mistake: a setup wizard or stale shell exported the
-// placeholder string. Without this check the server starts but every API
-// call returns 401 Invalid API Key, which is hard to diagnose.
-if (/^(YOUR_KEY_HERE|your_api_key_here|placeholder|changeme)$/i.test(FUB_API_KEY)) {
-  console.error(`ERROR: FUB_API_KEY is set to a placeholder value ("${FUB_API_KEY}").`);
-  console.error('Set it to a real FUB API key (starts with "fka_") in your .env or MCP host config.');
-  console.error('Note: shell-exported env vars override .env. Unset the placeholder first: `unset FUB_API_KEY`.');
-  process.exit(1);
-}
-
 export const FUB_SAFE_MODE = process.env.FUB_SAFE_MODE === 'true';
 const FUB_BASE_URL = 'https://api.followupboss.com/v1';
-const FUB_SYSTEM = process.env.FUB_SYSTEM || '';
-const FUB_SYSTEM_KEY = process.env.FUB_SYSTEM_KEY || '';
+const DEFAULT_FUB_API_KEY = process.env.FUB_API_KEY || '';
+const DEFAULT_FUB_SYSTEM = process.env.FUB_SYSTEM || '';
+const DEFAULT_FUB_SYSTEM_KEY = process.env.FUB_SYSTEM_KEY || '';
 
-const fubApi = axios.create({
-  baseURL: FUB_BASE_URL,
-  auth: { username: FUB_API_KEY, password: '' },
-  headers: {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json',
-    ...(FUB_SYSTEM ? { 'X-System': FUB_SYSTEM } : {}),
-    ...(FUB_SYSTEM_KEY ? { 'X-System-Key': FUB_SYSTEM_KEY } : {})
+function isPlaceholderApiKey(value) {
+  return /^(YOUR_KEY_HERE|your_api_key_here|placeholder|changeme)$/i.test(String(value || ''));
+}
+
+function resolveFubCredentials(input = {}) {
+  const apiKey = String(input.apiKey || DEFAULT_FUB_API_KEY || '').trim();
+  const system = String(input.system || DEFAULT_FUB_SYSTEM || '').trim();
+  const systemKey = String(input.systemKey || DEFAULT_FUB_SYSTEM_KEY || '').trim();
+  return { apiKey, system, systemKey };
+}
+
+function ensureValidApiKey(credentials) {
+  if (!credentials.apiKey) {
+    throw new Error('FUB API key is required. Pass `fubApiKey` query parameter on /mcp requests, or set FUB_API_KEY for local stdio usage.');
   }
-});
+  if (isPlaceholderApiKey(credentials.apiKey)) {
+    throw new Error('FUB API key is set to a placeholder value. Pass a real key in `fubApiKey` query parameter or FUB_API_KEY.');
+  }
+}
+
+function createFubApi(credentials) {
+  ensureValidApiKey(credentials);
+  return axios.create({
+    baseURL: FUB_BASE_URL,
+    auth: { username: credentials.apiKey, password: '' },
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      ...(credentials.system ? { 'X-System': credentials.system } : {}),
+      ...(credentials.systemKey ? { 'X-System-Key': credentials.systemKey } : {})
+    }
+  });
+}
 
 // MCP orchestration / internal params that must NEVER be forwarded to FUB API.
 // FUB returns 400 if any unknown field is in the body.
@@ -151,20 +160,20 @@ function translateDealCustomFieldArgs(args) {
   return out;
 }
 
-function requireWebhookCreds() {
-  if (!FUB_SYSTEM || !FUB_SYSTEM_KEY) {
+function requireWebhookCreds(credentials) {
+  if (!credentials.system || !credentials.systemKey) {
     throw new Error(
-      'Webhook endpoints require X-System + X-System-Key headers. Set FUB_SYSTEM and FUB_SYSTEM_KEY env vars to your registered third-party system name and key. Webhook creation is restricted to FUB account owners and registered systems.'
+      'Webhook endpoints require X-System + X-System-Key headers. Pass `fubSystem` and `fubSystemKey` query params (or env vars for stdio) with your registered third-party system name and key.'
     );
   }
 }
 
 // FUB marks many endpoints "Restricted - Registered Systems Only" — they
 // require X-System + X-System-Key, identical to webhooks. Generalized guard:
-function requireSystemCreds(toolName) {
-  if (!FUB_SYSTEM || !FUB_SYSTEM_KEY) {
+function requireSystemCreds(toolName, credentials) {
+  if (!credentials.system || !credentials.systemKey) {
     throw new Error(
-      `${toolName} requires X-System + X-System-Key headers (FUB marks this endpoint "Restricted - Registered Systems Only"). Set FUB_SYSTEM and FUB_SYSTEM_KEY env vars to your registered third-party system name and key. See https://docs.followupboss.com/reference#identification to register.`
+      `${toolName} requires X-System + X-System-Key headers (FUB marks this endpoint "Restricted - Registered Systems Only"). Pass \`fubSystem\` + \`fubSystemKey\` query params (or env vars for stdio). See https://docs.followupboss.com/reference#identification to register.`
     );
   }
 }
@@ -204,7 +213,7 @@ function translateAppointmentArgs(args) {
 // Retry logic for rate limiting (429)
 // ---------------------------------------------------------------------------
 
-async function fubApiWithRetry(method, ...methodArgs) {
+async function fubApiWithRetry(fubApi, method, ...methodArgs) {
   const maxRetries = 3;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -2300,8 +2309,22 @@ export const TOOL_DEFINITIONS = [
 // Tool Handler
 // ---------------------------------------------------------------------------
 
-export async function handleToolCall(name, rawArgs) {
+export async function handleToolCall(name, rawArgs, credentialsInput = null) {
   const args = stripMetaParams(rawArgs);
+  const credentials = resolveFubCredentials(credentialsInput || {});
+  let fubApiClient = null;
+  const getFubApi = () => {
+    if (!fubApiClient) fubApiClient = createFubApi(credentials);
+    return fubApiClient;
+  };
+  const fubApi = new Proxy({}, {
+    get(_target, prop) {
+      const client = getFubApi();
+      const value = client[prop];
+      return typeof value === 'function' ? value.bind(client) : value;
+    }
+  });
+  const apiWithRetry = (method, ...methodArgs) => fubApiWithRetry(getFubApi(), method, ...methodArgs);
   try {
     switch (name) {
 
@@ -2414,7 +2437,7 @@ export async function handleToolCall(name, rawArgs) {
 
     // ==================== PERSON ATTACHMENTS ====================
     case 'createPersonAttachment': {
-      requireSystemCreds('createPersonAttachment');
+      requireSystemCreds('createPersonAttachment', credentials);
       const response = await fubApi.post('/personAttachments', args);
       return response.data;
     }
@@ -2517,7 +2540,7 @@ export async function handleToolCall(name, rawArgs) {
       return { textMessages: response.data.textMessages || response.data.textmessages, _metadata: response.data._metadata };
     }
     case 'createTextMessage': {
-      requireSystemCreds('createTextMessage');
+      requireSystemCreds('createTextMessage', credentials);
       const response = await fubApi.post('/textMessages', args);
       return response.data;
     }
@@ -2571,32 +2594,32 @@ export async function handleToolCall(name, rawArgs) {
 
     // ==================== AUTOMATIONS ====================
     case 'listAutomations': {
-      requireSystemCreds('listAutomations');
+      requireSystemCreds('listAutomations', credentials);
       const response = await fubApi.get('/automations', { params: args });
       return { automations: response.data.automations, _metadata: response.data._metadata };
     }
     case 'getAutomation': {
-      requireSystemCreds('getAutomation');
+      requireSystemCreds('getAutomation', credentials);
       const response = await fubApi.get(`/automations/${args.id}`);
       return response.data;
     }
     case 'listAutomationsPeople': {
-      requireSystemCreds('listAutomationsPeople');
+      requireSystemCreds('listAutomationsPeople', credentials);
       const response = await fubApi.get('/automationsPeople', { params: args });
       return { automationsPeople: response.data.automationsPeople || response.data.automationspeople, _metadata: response.data._metadata };
     }
     case 'getAutomationPerson': {
-      requireSystemCreds('getAutomationPerson');
+      requireSystemCreds('getAutomationPerson', credentials);
       const response = await fubApi.get(`/automationsPeople/${args.id}`);
       return response.data;
     }
     case 'addPersonToAutomation': {
-      requireSystemCreds('addPersonToAutomation');
+      requireSystemCreds('addPersonToAutomation', credentials);
       const response = await fubApi.post('/automationsPeople', args);
       return response.data;
     }
     case 'updateAutomationPerson': {
-      requireSystemCreds('updateAutomationPerson');
+      requireSystemCreds('updateAutomationPerson', credentials);
       const { id, ...body } = args;
       const response = await fubApi.put(`/automationsPeople/${id}`, body);
       return response.data;
@@ -2821,12 +2844,12 @@ export async function handleToolCall(name, rawArgs) {
 
     // ==================== WEBHOOKS ====================
     case 'listWebhooks': {
-      requireWebhookCreds();
+      requireWebhookCreds(credentials);
       const response = await fubApi.get('/webhooks');
       return { webhooks: response.data.webhooks, _metadata: response.data._metadata };
     }
     case 'createWebhook': {
-      requireWebhookCreds();
+      requireWebhookCreds(credentials);
       const response = await fubApi.post('/webhooks', args);
       return response.data;
     }
@@ -2835,13 +2858,13 @@ export async function handleToolCall(name, rawArgs) {
       return response.data;
     }
     case 'updateWebhook': {
-      requireWebhookCreds();
+      requireWebhookCreds(credentials);
       const { id, ...body } = args;
       const response = await fubApi.put(`/webhooks/${id}`, body);
       return response.data;
     }
     case 'deleteWebhook': {
-      requireWebhookCreds();
+      requireWebhookCreds(credentials);
       await fubApi.delete(`/webhooks/${args.id}`);
       return { success: true, message: `Webhook ${args.id} deleted` };
     }
@@ -2900,7 +2923,7 @@ export async function handleToolCall(name, rawArgs) {
 
     // ==================== DEAL ATTACHMENTS ====================
     case 'createDealAttachment': {
-      requireSystemCreds('createDealAttachment');
+      requireSystemCreds('createDealAttachment', credentials);
       const response = await fubApi.post('/dealAttachments', args);
       return response.data;
     }
@@ -3106,18 +3129,18 @@ export async function handleToolCall(name, rawArgs) {
 
     // ==================== CONVENIENCE TOOLS ====================
     case 'removeTagFromPerson': {
-      const person = await fubApiWithRetry('get', `/people/${args.id}`);
+      const person = await apiWithRetry('get', `/people/${args.id}`);
       const currentTags = person.data.tags || [];
       const tagLower = args.tag.toLowerCase();
       const newTags = currentTags.filter(t => t.toLowerCase() !== tagLower);
       if (newTags.length === currentTags.length) {
         return { success: false, message: `Tag "${args.tag}" not found on person ${args.id}`, currentTags };
       }
-      const response = await fubApiWithRetry('put', `/people/${args.id}`, { tags: newTags });
+      const response = await apiWithRetry('put', `/people/${args.id}`, { tags: newTags });
       return { success: true, message: `Tag "${args.tag}" removed`, removedTag: args.tag, remainingTags: newTags };
     }
     case 'getPersonByEmail': {
-      const response = await fubApiWithRetry('get', '/people', { params: { email: args.email, limit: 1 } });
+      const response = await apiWithRetry('get', '/people', { params: { email: args.email, limit: 1 } });
       const people = response.data.people || [];
       if (people.length === 0) {
         return { found: false, message: `No person found with email ${args.email}` };
@@ -3126,7 +3149,7 @@ export async function handleToolCall(name, rawArgs) {
     }
     case 'searchPeopleByTag': {
       const { tags, ...params } = args;
-      const response = await fubApiWithRetry('get', '/people', { params: { tags, ...params } });
+      const response = await apiWithRetry('get', '/people', { params: { tags, ...params } });
       return { people: response.data.people, _metadata: response.data._metadata };
     }
     case 'bulkUpdatePeople': {
@@ -3136,7 +3159,7 @@ export async function handleToolCall(name, rawArgs) {
       for (let i = 0; i < ids.length; i++) {
         try {
           const params = mergeTags !== undefined ? { mergeTags } : {};
-          const response = await fubApiWithRetry('put', `/people/${ids[i]}`, updates, { params });
+          const response = await apiWithRetry('put', `/people/${ids[i]}`, updates, { params });
           results.push({ id: ids[i], success: true });
         } catch (error) {
           results.push({ id: ids[i], success: false, error: error.response?.data?.errorMessage || error.message });
@@ -3155,7 +3178,7 @@ export async function handleToolCall(name, rawArgs) {
       let offset = 0;
       const pageSize = 100;
       while (offset < scanLimit) {
-        const response = await fubApiWithRetry('get', '/people', { params: { limit: pageSize, offset, fields: 'tags' } });
+        const response = await apiWithRetry('get', '/people', { params: { limit: pageSize, offset, fields: 'tags' } });
         const people = response.data.people || [];
         if (people.length === 0) break;
         for (const person of people) {
@@ -3196,7 +3219,7 @@ export const activeTools = FUB_SAFE_MODE
  *   server handshake. Useful for private deployments that want to identify themselves.
  */
 export function createServer(opts = {}) {
-  const { extraTools = [], extraHandler = null, serverInfo = {} } = opts;
+  const { extraTools = [], extraHandler = null, serverInfo = {}, getCredentials = null } = opts;
 
   const server = new Server(
     {
@@ -3229,7 +3252,8 @@ export function createServer(opts = {}) {
       if (extraToolNames.has(name) && extraHandler) {
         result = await extraHandler(name, args || {});
       } else {
-        result = await handleToolCall(name, args || {});
+        const credentials = getCredentials ? getCredentials() : null;
+        result = await handleToolCall(name, args || {}, credentials);
       }
       return {
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
@@ -3270,6 +3294,7 @@ export async function startStdio(opts = {}) {
 }
 
 export async function startHttp(opts = {}) {
+  const noListen = opts.noListen === true;
   const PORT = parseInt(process.env.PORT || '3000', 10);
   const BEARER = process.env.MCP_BEARER_TOKEN;
   const AUTH_PASSWORD = process.env.MCP_AUTH_PASSWORD;
@@ -3319,6 +3344,64 @@ export async function startHttp(opts = {}) {
     if (ab.length !== bb.length) return false;
     return timingSafeEqual(ab, bb);
   }
+
+  function extractCredentialsFromQuery(query = {}) {
+    const valueOf = (...keys) => {
+      for (const key of keys) {
+        const value = query[key];
+        if (Array.isArray(value)) return { duplicate: true, value: '' };
+        if (value !== undefined && value !== null && String(value).trim() !== '') return String(value).trim();
+      }
+      return '';
+    };
+    const apiKeyValue = valueOf('fubApiKey', 'fub_api_key', 'apiKey', 'api_key');
+    const systemValue = valueOf('fubSystem', 'fub_system', 'system');
+    const systemKeyValue = valueOf('fubSystemKey', 'fub_system_key', 'systemKey', 'system_key');
+    return {
+      apiKey: typeof apiKeyValue === 'string' ? apiKeyValue : '',
+      system: typeof systemValue === 'string' ? systemValue : '',
+      systemKey: typeof systemKeyValue === 'string' ? systemKeyValue : '',
+      hasDuplicates: [apiKeyValue, systemValue, systemKeyValue].some(v => typeof v === 'object' && v.duplicate)
+    };
+  }
+
+  function validateQueryCredentials(req, res, next) {
+    const credentials = extractCredentialsFromQuery(req.query || {});
+    if (credentials.hasDuplicates) {
+      return res.status(400).json({
+        error: 'duplicate_query_param',
+        message: 'Duplicate credential query parameters are not allowed.'
+      });
+    }
+    if (!credentials.apiKey) {
+      return res.status(400).json({
+        error: 'missing_fub_api_key',
+        message: 'Each /mcp request must include ?fubApiKey=... query parameter.'
+      });
+    }
+    if (isPlaceholderApiKey(credentials.apiKey)) {
+      return res.status(400).json({
+        error: 'invalid_fub_api_key',
+        message: 'fubApiKey cannot be a placeholder value.'
+      });
+    }
+    req.fubCredentials = credentials;
+    next();
+  }
+
+  function credentialsMatch(a, b) {
+    return constantTimeEq(a.apiKey, b.apiKey)
+      && constantTimeEq(a.system, b.system)
+      && constantTimeEq(a.systemKey, b.systemKey);
+  }
+
+  const mcpRateLimit = rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'rate_limited' }
+  });
 
   // Health endpoint (no auth)
   app.get('/health', (_req, res) => {
@@ -3518,55 +3601,87 @@ export async function startHttp(opts = {}) {
 
   // Stateful transport: each session gets its own transport + server instance.
   // The SDK's Server can only be connected to one transport at a time.
-  const transports = new Map(); // sessionId -> transport
+  const sessions = new Map(); // sessionId -> { transport, credentials }
 
-  app.post('/mcp', requireAuth, async (req, res) => {
+  app.set('trust proxy', 1);
+
+  app.post('/mcp', mcpRateLimit, requireAuth, validateQueryCredentials, async (req, res) => {
     const sessionId = req.headers['mcp-session-id'];
-    let transport = sessionId ? transports.get(sessionId) : undefined;
-    if (!transport) {
-      const mcpServer = createServer(opts);
-      transport = new StreamableHTTPServerTransport({
+    let session = sessionId ? sessions.get(sessionId) : undefined;
+    if (!session) {
+      session = {
+        transport: null,
+        credentials: req.fubCredentials,
+      };
+      const mcpServer = createServer({
+        ...opts,
+        getCredentials: () => session.credentials
+      });
+      const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
-        onsessioninitialized: (id) => transports.set(id, transport)
+        onsessioninitialized: (id) => {
+          session.transport = transport;
+          sessions.set(id, session);
+        }
       });
       transport.onclose = () => {
-        if (transport.sessionId) transports.delete(transport.sessionId);
+        if (transport.sessionId) sessions.delete(transport.sessionId);
       };
       await mcpServer.connect(transport);
+      session.transport = transport;
+    } else {
+      if (!credentialsMatch(session.credentials, req.fubCredentials)) {
+        return res.status(409).json({
+          error: 'credential_mismatch',
+          message: 'Provided query credentials do not match this session.'
+        });
+      }
     }
     try {
-      await transport.handleRequest(req, res, req.body);
+      await session.transport.handleRequest(req, res, req.body);
     } catch (e) {
       console.error('MCP POST error', e);
       if (!res.headersSent) res.status(500).json({ error: 'transport_error' });
     }
   });
 
-  app.get('/mcp', requireAuth, async (req, res) => {
+  app.get('/mcp', mcpRateLimit, requireAuth, validateQueryCredentials, async (req, res) => {
     const sessionId = req.headers['mcp-session-id'];
-    const transport = sessionId ? transports.get(sessionId) : undefined;
-    if (!transport) return res.status(400).json({ error: 'invalid_session' });
+    const session = sessionId ? sessions.get(sessionId) : undefined;
+    if (!session) return res.status(400).json({ error: 'invalid_session' });
+    if (!credentialsMatch(session.credentials, req.fubCredentials)) {
+      return res.status(409).json({ error: 'credential_mismatch', message: 'Provided query credentials do not match this session.' });
+    }
     try {
-      await transport.handleRequest(req, res);
+      await session.transport.handleRequest(req, res);
     } catch (e) {
       console.error('MCP GET error', e);
     }
   });
 
-  app.delete('/mcp', requireAuth, async (req, res) => {
+  app.delete('/mcp', mcpRateLimit, requireAuth, validateQueryCredentials, async (req, res) => {
     const sessionId = req.headers['mcp-session-id'];
-    const transport = sessionId ? transports.get(sessionId) : undefined;
-    if (!transport) return res.status(400).json({ error: 'invalid_session' });
+    const session = sessionId ? sessions.get(sessionId) : undefined;
+    if (!session) return res.status(400).json({ error: 'invalid_session' });
+    if (!credentialsMatch(session.credentials, req.fubCredentials)) {
+      return res.status(409).json({ error: 'credential_mismatch', message: 'Provided query credentials do not match this session.' });
+    }
     try {
-      await transport.handleRequest(req, res);
+      await session.transport.handleRequest(req, res);
     } catch (e) {
       console.error('MCP DELETE error', e);
     }
   });
 
+  if (noListen) {
+    return app;
+  }
+
   app.listen(PORT, () => {
     console.error(`Follow Up Boss MCP Server v1.3.1 listening on :${PORT} (HTTP, ${activeTools.length} tools${FUB_SAFE_MODE ? ', SAFE MODE' : ''})`);
   });
+
+  return app;
 }
 
 async function main() {

@@ -357,6 +357,30 @@ These tools only support **remote** MCP servers (hosted on the internet), not lo
 
 If there's enough interest, we may add a hosted version in the future. For now, we recommend using one of the tools listed above that support local MCP servers.
 
+### AWS SAM + Lambda URL Deployment
+
+This repo now includes:
+
+- `template.yaml` for AWS SAM deployment to a **single Lambda** with a **Lambda Function URL**
+- `.github/workflows/deploy.yml` for GitHub Actions CI/CD using OIDC and `aws-actions/configure-aws-credentials`
+
+For hosted HTTP usage, pass Follow Up Boss credentials as **query parameters on every `/mcp` request**:
+
+- `fubApiKey` (required)
+- `fubSystem` (optional, for restricted endpoints)
+- `fubSystemKey` (optional, for restricted endpoints)
+
+Example:
+
+```text
+POST https://<lambda-url>/mcp?fubApiKey=...&fubSystem=...&fubSystemKey=...
+```
+
+Security note: query parameters can appear in URL logs and monitoring systems. This is not ideal for production-grade secret handling; prefer a private endpoint and additional auth controls if possible. If you use this query-param flow, use HTTPS only, restrict access to your Lambda URL, and never share full URLs with embedded credentials.
+The provided `template.yaml` sets `AuthType: NONE` and `MCP_AUTH_DISABLED: true` by default; change those settings if you need authenticated access.
+
+No API keys need to be stored on the Lambda as environment secrets for this flow.
+
 ## Usage Examples
 
 Once connected, just talk to your AI tool normally. Here are some things you can ask:
